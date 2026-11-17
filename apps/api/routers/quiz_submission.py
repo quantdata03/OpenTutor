@@ -119,6 +119,48 @@ async def _auto_detect_confusion(course_id: uuid.UUID, user_id: uuid.UUID) -> No
         logger.exception("Auto confusion detection failed (best-effort)")
 
 
+async def _classify_wrong_answer(
+    practice_result_id: uuid.UUID,
+    wrong_answer_id: uuid.UUID,
+    problem_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> None:
+    """Background task: classify an already-persisted wrong answer."""
+    try:
+        async with async_session() as db:
+            from models.ingestion import WrongAnswer
+            result = await db.execute(
+                select(PracticeResult, WrongAnswer, PracticeProblem)
+                .join(WrongAnswer, WrongAnswer.problem_id == PracticeResult.problem_id)
+                .join(PracticeProblem, PracticeProblem.id == PracticeResult.problem_id)
+                .where(
+                    PracticeResult.id == practice_result_id,
+                    WrongAnswer.id == wrong_answer_id,
+                    PracticeProblem.id == problem_id,
+                    PracticeResult.user_id == user_id,
+                    WrongAnswer.user_id == user_id,
+                )
+            )
+            row = result.one_or_none()
+            if not row:
+                return
+            practice_result, wrong_answer, problem = row
+            from services.diagnosis.classifier import classify_error
+            classification = await classify_error(
+                question=problem.question,
+                correct_answer=problem.correct_answer or "",
+                user_answer=practice_result.user_answer,
+                problem_metadata=problem.problem_metadata,
+            )
+            error_category = classification["category"]
+            practice_result.error_category = error_category
+            wrong_answer.error_category = error_category
+            wrong_answer.error_detail = classification
+            await db.commit()
+    except (SQLAlchemyError, ValueError, KeyError, TypeError, OSError):
+        logger.exception("Background error classification failed (best-effort)")
+
+
 @router.post("/submit", response_model=AnswerResponse, summary="Submit a quiz answer", description="Grade a practice answer, classify errors, and update mastery tracking.")
 async def submit_answer(
     body: SubmitAnswerRequest,
@@ -184,22 +226,9 @@ async def submit_answer(
         answer_time_ms=body.answer_time_ms,
     )
 
+    # Persist the answer before any optional LLM work. Error classification is
+    # scheduled below so request latency never depends on a model call.
     error_category = None
-    classification = None
-    if not is_correct and problem.correct_answer:
-        try:
-            from services.diagnosis.classifier import classify_error
-            classification = await classify_error(
-                question=problem.question,
-                correct_answer=problem.correct_answer,
-                user_answer=body.user_answer,
-                problem_metadata=problem.problem_metadata,
-            )
-            error_category = classification["category"]
-            pr.error_category = error_category
-        except (ValueError, KeyError, TypeError, OSError):
-            logger.exception("Error classification failed (best-effort)")
-            warnings.append("error_classification_failed")
 
     db.add(pr)
 
@@ -214,7 +243,7 @@ async def submit_answer(
             correct_answer=problem.correct_answer,
             explanation=problem.explanation,
             error_category=error_category,
-            error_detail=classification if error_category else None,
+            error_detail=None,
             knowledge_points=problem.knowledge_points,
         )
         db.add(wa)
@@ -268,6 +297,9 @@ async def submit_answer(
     await db.commit()
 
     if not is_correct and wa:
+        background_tasks.add_task(
+            _classify_wrong_answer, pr.id, wa.id, problem.id, user.id
+        )
         background_tasks.add_task(_auto_derive_diagnostic, wa.id, user.id)
         # Auto-detect confusion pairs from accumulated wrong answers
         background_tasks.add_task(_auto_detect_confusion, problem.course_id, user.id)

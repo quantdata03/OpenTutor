@@ -23,6 +23,7 @@ from models.knowledge_graph import ConceptMastery, KnowledgeNode
 from models.practice import PracticeProblem, PracticeResult
 from models.progress import LearningProgress
 from models.user import User
+import routers.quiz_submission as quiz_submission_router
 from routers.quiz_submission import submit_answer
 from schemas.quiz import SubmitAnswerRequest
 
@@ -113,35 +114,65 @@ async def test_grading_is_case_and_whitespace_insensitive(db, user, course):
 
 
 @pytest.mark.asyncio
-async def test_incorrect_answer_triggers_error_classification(db, user, course):
+async def test_incorrect_answer_persists_before_background_classification(db, user, course):
     problem = await _make_problem(db, course)
+    tasks = BackgroundTasks()
     classify = AsyncMock(return_value={"category": "conceptual", "detail": "confused with Lyon"})
     with patch("services.diagnosis.classifier.classify_error", classify):
-        resp = await _submit(db, user, problem.id, "Lyon")
+        resp = await _submit(db, user, problem.id, "Lyon", tasks=tasks)
 
     assert resp.is_correct is False
-    classify.assert_awaited_once()
+    classify.assert_not_awaited()
 
     result = (await db.execute(select(PracticeResult))).scalar_one()
-    assert result.error_category == "conceptual"
+    assert result.error_category is None
 
     wa = (await db.execute(select(WrongAnswer))).scalar_one()
-    assert wa.user_answer == "Lyon" and wa.error_category == "conceptual"
+    assert wa.user_answer == "Lyon" and wa.error_category is None
+    assert tasks.tasks[0].func.__name__ == "_classify_wrong_answer"
 
 
 @pytest.mark.asyncio
-async def test_classifier_failure_degrades_with_warning(db, user, course):
+async def test_classifier_is_not_on_the_submission_request_path(db, user, course):
     problem = await _make_problem(db, course)
+    tasks = BackgroundTasks()
     with patch(
         "services.diagnosis.classifier.classify_error",
         AsyncMock(side_effect=ValueError("LLM unavailable")),
-    ):
-        resp = await _submit(db, user, problem.id, "Lyon")
+    ) as classify:
+        resp = await _submit(db, user, problem.id, "Lyon", tasks=tasks)
 
     assert resp.is_correct is False
-    assert "error_classification_failed" in resp.warnings
+    assert resp.warnings == []
+    classify.assert_not_awaited()
     # The submission itself must still persist
     assert (await db.execute(select(PracticeResult))).scalar_one().is_correct is False
+
+
+@pytest.mark.asyncio
+async def test_background_classification_updates_persisted_records(db, user, course, monkeypatch):
+    problem = await _make_problem(db, course)
+    tasks = BackgroundTasks()
+    await _submit(db, user, problem.id, "Lyon", tasks=tasks)
+
+    class ExistingSessionContext:
+        async def __aenter__(self):
+            return db
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(quiz_submission_router, "async_session", lambda: ExistingSessionContext())
+    with patch(
+        "services.diagnosis.classifier.classify_error",
+        AsyncMock(return_value={"category": "conceptual", "confidence": 1.0}),
+    ):
+        await tasks.tasks[0]()
+
+    result = (await db.execute(select(PracticeResult))).scalar_one()
+    wrong = (await db.execute(select(WrongAnswer))).scalar_one()
+    assert result.error_category == "conceptual"
+    assert wrong.error_category == "conceptual"
+    assert wrong.error_detail == {"category": "conceptual", "confidence": 1.0}
 
 
 @pytest.mark.asyncio
@@ -153,8 +184,11 @@ async def test_wrong_answer_schedules_background_diagnostics(db, user, course):
         AsyncMock(return_value={"category": "careless"}),
     ):
         await _submit(db, user, problem.id, "Lyon", tasks=tasks)
-    # auto-derive diagnostic + confusion detection
-    assert len(tasks.tasks) == 2
+    # async classification + auto-derive diagnostic + confusion detection
+    assert len(tasks.tasks) == 3
+    assert [task.func.__name__ for task in tasks.tasks] == [
+        "_classify_wrong_answer", "_auto_derive_diagnostic", "_auto_detect_confusion",
+    ]
 
 
 @pytest.mark.asyncio
