@@ -1,5 +1,6 @@
 """Quiz submission endpoints: submit answers, list problems, mastery history."""
 
+import asyncio
 import logging
 import uuid
 
@@ -28,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from libs.exceptions import NotFoundError, ValidationError
 
 router = APIRouter()
+_post_submission_tasks: set[asyncio.Task[None]] = set()
 
 
 @router.get("/{course_id}", response_model=list[ProblemResponse], summary="List practice problems", description="Return paginated practice problems for a course, excluding diagnostics.")
@@ -159,6 +161,38 @@ async def _classify_wrong_answer(
             await db.commit()
     except (SQLAlchemyError, ValueError, KeyError, TypeError, OSError):
         logger.exception("Background error classification failed (best-effort)")
+
+
+async def _process_wrong_answer_after_response(
+    practice_result_id: uuid.UUID,
+    wrong_answer_id: uuid.UUID,
+    problem_id: uuid.UUID,
+    course_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> None:
+    """Run the existing best-effort diagnosis chain outside request completion."""
+    await _classify_wrong_answer(
+        practice_result_id, wrong_answer_id, problem_id, user_id
+    )
+    await _auto_derive_diagnostic(wrong_answer_id, user_id)
+    await _auto_detect_confusion(course_id, user_id)
+
+
+async def _schedule_wrong_answer_postprocessing(
+    practice_result_id: uuid.UUID,
+    wrong_answer_id: uuid.UUID,
+    problem_id: uuid.UUID,
+    course_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> None:
+    """Detach post-submit diagnosis after the response body has been sent."""
+    task = asyncio.create_task(
+        _process_wrong_answer_after_response(
+            practice_result_id, wrong_answer_id, problem_id, course_id, user_id
+        )
+    )
+    _post_submission_tasks.add(task)
+    task.add_done_callback(_post_submission_tasks.discard)
 
 
 @router.post("/submit", response_model=AnswerResponse, summary="Submit a quiz answer", description="Grade a practice answer, classify errors, and update mastery tracking.")
@@ -298,11 +332,13 @@ async def submit_answer(
 
     if not is_correct and wa:
         background_tasks.add_task(
-            _classify_wrong_answer, pr.id, wa.id, problem.id, user.id
+            _schedule_wrong_answer_postprocessing,
+            pr.id,
+            wa.id,
+            problem.id,
+            problem.course_id,
+            user.id,
         )
-        background_tasks.add_task(_auto_derive_diagnostic, wa.id, user.id)
-        # Auto-detect confusion pairs from accumulated wrong answers
-        background_tasks.add_task(_auto_detect_confusion, problem.course_id, user.id)
 
     # Detect improvement: correct answer on a previously-wrong problem → effective_review signal
     if is_correct:

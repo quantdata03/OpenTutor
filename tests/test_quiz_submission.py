@@ -5,6 +5,7 @@ in-memory SQLite database (auth dependency bypassed by passing the user),
 with the LLM-backed error classifier mocked for determinism.
 """
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -129,7 +130,7 @@ async def test_incorrect_answer_persists_before_background_classification(db, us
 
     wa = (await db.execute(select(WrongAnswer))).scalar_one()
     assert wa.user_answer == "Lyon" and wa.error_category is None
-    assert tasks.tasks[0].func.__name__ == "_classify_wrong_answer"
+    assert tasks.tasks[0].func.__name__ == "_schedule_wrong_answer_postprocessing"
 
 
 @pytest.mark.asyncio
@@ -166,7 +167,12 @@ async def test_background_classification_updates_persisted_records(db, user, cou
         "services.diagnosis.classifier.classify_error",
         AsyncMock(return_value={"category": "conceptual", "confidence": 1.0}),
     ):
-        await tasks.tasks[0]()
+        with (
+            patch.object(quiz_submission_router, "_auto_derive_diagnostic", AsyncMock()),
+            patch.object(quiz_submission_router, "_auto_detect_confusion", AsyncMock()),
+        ):
+            await tasks.tasks[0]()
+            await asyncio.gather(*list(quiz_submission_router._post_submission_tasks))
 
     result = (await db.execute(select(PracticeResult))).scalar_one()
     wrong = (await db.execute(select(WrongAnswer))).scalar_one()
@@ -184,10 +190,10 @@ async def test_wrong_answer_schedules_background_diagnostics(db, user, course):
         AsyncMock(return_value={"category": "careless"}),
     ):
         await _submit(db, user, problem.id, "Lyon", tasks=tasks)
-    # async classification + auto-derive diagnostic + confusion detection
-    assert len(tasks.tasks) == 3
+    # One immediate scheduler detaches the ordered classify/derive/confusion chain.
+    assert len(tasks.tasks) == 1
     assert [task.func.__name__ for task in tasks.tasks] == [
-        "_classify_wrong_answer", "_auto_derive_diagnostic", "_auto_detect_confusion",
+        "_schedule_wrong_answer_postprocessing",
     ]
 
 
