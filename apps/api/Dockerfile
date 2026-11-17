@@ -5,29 +5,23 @@ WORKDIR /build
 
 ARG PYTHON_REQUIREMENTS=requirements-full.txt
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements-core.txt requirements-full.txt requirements.txt ./
-RUN pip install --no-cache-dir --prefix=/install -r "${PYTHON_REQUIREMENTS}"
+RUN pip install --no-cache-dir --retries 8 --timeout 180 --prefix=/install -r "${PYTHON_REQUIREMENTS}"
 
 # ---- Runtime stage ----
 FROM python:3.11-slim
 
 WORKDIR /app
+RUN apt-get -o Acquire::ForceIPv4=true update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 # Runtime-only system deps (curl for healthcheck, docker CLI for sandbox)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl docker.io \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy installed Python packages from builder
 COPY --from=builder /install /usr/local
 
 # Create non-root user
 RUN groupadd -r opentutor && useradd -r -g opentutor -d /app -s /sbin/nologin opentutor \
-    && mkdir -p /app/uploads && chown -R opentutor:opentutor /app
+    && mkdir -p /app/uploads /app/data && chown -R opentutor:opentutor /app
 
 COPY --chown=opentutor:opentutor . .
 

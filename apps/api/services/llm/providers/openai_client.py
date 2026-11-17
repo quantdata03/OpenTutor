@@ -119,6 +119,8 @@ class OpenAIClient(LLMClient):
             user_content = _build_openai_user_content(user_message, images)
             response = await self.client.chat.completions.create(
                 model=self.model,
+                max_tokens=2048,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},

@@ -45,7 +45,7 @@ Given the content below, extract or generate practice questions. Follow these ru
 2. Each question should test understanding, not just recall
 3. For multiple choice, always provide exactly 4 options (A, B, C, D)
 4. Include the correct answer and a brief explanation
-5. Generate 3-8 questions depending on content length and complexity
+5. Generate exactly 3 questions for this source excerpt; keep each question and explanation concise.
 6. For EACH question, provide structured learning metadata:
    - difficulty_layer: 1 basic understanding, 2 standard application, 3 advanced/tricky transfer
    - core_concept: the main concept being tested

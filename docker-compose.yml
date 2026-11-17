@@ -99,7 +99,7 @@ services:
     ports:
       - "${WEB_PORT:-3001}:3001"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3001 || exit 1"]
+      test: ["CMD-SHELL", "node -e 'fetch(process.argv[1]).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' http://127.0.0.1:3001"]
       interval: 10s
       timeout: 5s
       retries: 5
