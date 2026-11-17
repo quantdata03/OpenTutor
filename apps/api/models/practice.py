@@ -4,7 +4,18 @@ import uuid
 from typing import Optional
 from datetime import datetime
 
-from sqlalchemy import Index, String, DateTime, ForeignKey, Text, Integer, Boolean, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from models.compat import CompatUUID, CompatJSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -91,3 +102,83 @@ class PracticeResult(Base):
 
     # Relationships
     problem = relationship("PracticeProblem", back_populates="results")
+
+
+class PracticeSession(Base):
+    """A server-verified, immutable whole-practice attempt."""
+
+    __tablename__ = "practice_sessions"
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'finalized')", name="ck_practice_session_status"),
+        UniqueConstraint("user_id", "finalize_key", name="uq_practice_session_user_finalize_key"),
+        Index("ix_practice_session_user_finalized", "user_id", "finalized_at", "id"),
+        Index(
+            "ix_practice_session_user_course_finalized",
+            "user_id",
+            "course_id",
+            "finalized_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(CompatUUID, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        CompatUUID, ForeignKey("users.id", ondelete="CASCADE")
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        CompatUUID, ForeignKey("courses.id", ondelete="RESTRICT")
+    )
+    status: Mapped[str] = mapped_column(String(12), default="open")
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finalized_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    total_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    correct_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    blank_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    finalize_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
+    items = relationship(
+        "PracticeSessionItem",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="PracticeSessionItem.ordinal",
+    )
+
+
+class PracticeSessionItem(Base):
+    """An ordered practice item linked to at most one persisted result."""
+
+    __tablename__ = "practice_session_items"
+    __table_args__ = (
+        UniqueConstraint("session_id", "ordinal", name="uq_practice_session_item_ordinal"),
+        UniqueConstraint("session_id", "problem_id", name="uq_practice_session_item_problem"),
+        UniqueConstraint(
+            "session_id", "submission_key", name="uq_practice_session_item_submission_key"
+        ),
+        UniqueConstraint("result_id", name="uq_practice_session_item_result"),
+        Index("ix_practice_session_item_session", "session_id", "ordinal"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(CompatUUID, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        CompatUUID, ForeignKey("practice_sessions.id", ondelete="CASCADE")
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        CompatUUID, ForeignKey("practice_problems.id", ondelete="RESTRICT")
+    )
+    result_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        CompatUUID,
+        ForeignKey("practice_results.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    submission_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    is_blank: Mapped[bool] = mapped_column(Boolean, default=False)
+    user_answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    review_snapshot: Mapped[dict] = mapped_column(CompatJSONB)
+
+    session = relationship("PracticeSession", back_populates="items")

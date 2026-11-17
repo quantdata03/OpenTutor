@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import uuid
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -195,58 +196,78 @@ async def _schedule_wrong_answer_postprocessing(
     task.add_done_callback(_post_submission_tasks.discard)
 
 
-@router.post("/submit", response_model=AnswerResponse, summary="Submit a quiz answer", description="Grade a practice answer, classify errors, and update mastery tracking.")
-async def submit_answer(
+async def persist_problem_answer(
     body: SubmitAnswerRequest,
     background_tasks: BackgroundTasks,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Submit an answer to a practice problem."""
-    result = await db.execute(
-        select(PracticeProblem)
-        .join(Course, PracticeProblem.course_id == Course.id)
-        .where(
-            PracticeProblem.id == body.problem_id,
-            Course.user_id == user.id,
+    user: User,
+    db: AsyncSession,
+    *,
+    problem: PracticeProblem | None = None,
+    review_snapshot: dict[str, Any] | None = None,
+    session_item: Any | None = None,
+) -> dict[str, Any]:
+    """Grade and persist one answer through the canonical quiz write path.
+
+    Session-aware callers reserve their item before entering this function and
+    pass it as ``session_item``. The result link is then committed in the same
+    transaction as PracticeResult, WrongAnswer and the existing progress rows.
+    """
+    if problem is None:
+        result = await db.execute(
+            select(PracticeProblem)
+            .join(Course, PracticeProblem.course_id == Course.id)
+            .where(
+                PracticeProblem.id == body.problem_id,
+                Course.user_id == user.id,
+            )
         )
-    )
-    problem = result.scalar_one_or_none()
+        problem = result.scalar_one_or_none()
     if not problem:
         raise NotFoundError("Problem", body.problem_id)
 
+    snapshot = review_snapshot or {}
+    question_type = str(snapshot.get("question_type") or problem.question_type)
+    question = str(snapshot.get("question") or problem.question)
+    correct_answer = snapshot.get("correct_answer", problem.correct_answer)
+    explanation = snapshot.get("explanation", problem.explanation)
+    options = snapshot.get("options", problem.options)
+    problem_metadata = snapshot.get("problem_metadata", problem.problem_metadata)
+    difficulty_layer = snapshot.get("difficulty_layer", problem.difficulty_layer)
+    knowledge_points = snapshot.get("knowledge_points", problem.knowledge_points)
+
     # A missing answer key is a question defect, not evidence of learner error.
     # Coding has its own grading contract and may not require a reference.
-    if problem.question_type != "coding" and not (problem.correct_answer or "").strip():
+    if question_type != "coding" and not str(correct_answer or "").strip():
         raise ValidationError("This question has no reference answer and cannot be graded.")
 
     warnings: list[str] = []
-
     is_correct = False
-    if problem.question_type == "coding":
+    if question_type == "coding":
         try:
             from services.diagnosis.coding_grader import grade_coding_answer
             grading_result = await grade_coding_answer(
-                question=problem.question,
-                reference_answer=problem.correct_answer or "",
+                question=question,
+                reference_answer=str(correct_answer or ""),
                 user_code=body.user_answer,
             )
             is_correct = grading_result.get("is_correct", False)
         except (ValueError, KeyError, TypeError, OSError):
             logger.exception("Coding grading failed (best-effort)")
             warnings.append("coding_grading_failed")
-    elif problem.question_type == "select_all":
+    elif question_type == "select_all":
         is_correct = grade_select_all_answer(
-            body.user_answer, problem.correct_answer or "",
-            normalize_question_options(problem.options),
+            body.user_answer,
+            str(correct_answer or ""),
+            normalize_question_options(options),
         )
-    elif problem.correct_answer:
+    elif correct_answer:
         is_correct = grade_text_answer(
-            body.user_answer, problem.correct_answer,
+            body.user_answer,
+            str(correct_answer),
             numeric=(
-                problem.question_type in {"short_answer", "fill_blank"}
-                and isinstance(problem.problem_metadata, dict)
-                and problem.problem_metadata.get("answer_type") == "number"
+                question_type in {"short_answer", "fill_blank"}
+                and isinstance(problem_metadata, dict)
+                and problem_metadata.get("answer_type") == "number"
             ),
         )
 
@@ -255,17 +276,13 @@ async def submit_answer(
         user_id=user.id,
         user_answer=body.user_answer,
         is_correct=is_correct,
-        ai_explanation=problem.explanation,
-        difficulty_layer=problem.difficulty_layer,
+        ai_explanation=explanation,
+        difficulty_layer=difficulty_layer,
         answer_time_ms=body.answer_time_ms,
     )
-
-    # Persist the answer before any optional LLM work. Error classification is
-    # scheduled below so request latency never depends on a model call.
-    error_category = None
-
     db.add(pr)
 
+    error_category = None
     wa = None
     if not is_correct:
         from models.ingestion import WrongAnswer
@@ -274,11 +291,11 @@ async def submit_answer(
             problem_id=problem.id,
             course_id=problem.course_id,
             user_answer=body.user_answer,
-            correct_answer=problem.correct_answer,
-            explanation=problem.explanation,
+            correct_answer=correct_answer,
+            explanation=explanation,
             error_category=error_category,
             error_detail=None,
-            knowledge_points=problem.knowledge_points,
+            knowledge_points=knowledge_points,
         )
         db.add(wa)
 
@@ -293,25 +310,27 @@ async def submit_answer(
         logger.exception("Progress update failed (best-effort)")
         warnings.append("progress_update_failed")
 
-    # Normalize knowledge_points to list[str] for consistent handling
-    _kp = problem.knowledge_points
     kp_list: list[str] = (
-        [str(x) for x in _kp] if isinstance(_kp, list)
-        else [_kp] if isinstance(_kp, str)
+        [str(x) for x in knowledge_points] if isinstance(knowledge_points, list)
+        else [knowledge_points] if isinstance(knowledge_points, str)
         else []
     )
-
-    # Update LOOM concept mastery for each knowledge point
     if kp_list:
         from services.loom_mastery import update_concept_mastery
         for kp in kp_list:
             try:
-                await update_concept_mastery(db, user.id, str(kp), problem.course_id, correct=is_correct, question_type=problem.question_type)
+                await update_concept_mastery(
+                    db,
+                    user.id,
+                    str(kp),
+                    problem.course_id,
+                    correct=is_correct,
+                    question_type=question_type,
+                )
             except (SQLAlchemyError, ValueError, KeyError):
                 logger.exception("Concept mastery update failed for '%s'", kp)
                 warnings.append("concept_mastery_update_failed")
 
-    # Emit analytics event before committing — single transaction for atomicity
     try:
         from services.analytics.events import emit_quiz_answered
         await emit_quiz_answered(
@@ -328,7 +347,14 @@ async def submit_answer(
         logger.exception("Learning event emission failed (best-effort)")
         warnings.append("analytics_event_failed")
 
+    await db.flush()
+    if session_item is not None:
+        session_item.result_id = pr.id
+        session_item.user_answer = body.user_answer
+        session_item.is_correct = is_correct
+        session_item.is_blank = not bool(body.user_answer.strip())
     await db.commit()
+    await db.refresh(pr)
 
     if not is_correct and wa:
         background_tasks.add_task(
@@ -339,14 +365,11 @@ async def submit_answer(
             problem.course_id,
             user.id,
         )
-
-    # Detect improvement: correct answer on a previously-wrong problem → effective_review signal
     if is_correct:
         background_tasks.add_task(
             _check_effective_review, problem.id, problem.course_id, user.id
         )
 
-    # Check prerequisite gaps on wrong answers
     prerequisite_gaps = None
     if not is_correct and kp_list:
         try:
@@ -361,12 +384,31 @@ async def submit_answer(
             logger.exception("Prerequisite gap check failed (best-effort)")
             warnings.append("prerequisite_gap_check_failed")
 
+    return {
+        "result": pr,
+        "is_correct": is_correct,
+        "correct_answer": correct_answer,
+        "explanation": explanation,
+        "prerequisite_gaps": prerequisite_gaps,
+        "warnings": warnings,
+    }
+
+
+@router.post("/submit", response_model=AnswerResponse, summary="Submit a quiz answer", description="Grade a practice answer, classify errors, and update mastery tracking.")
+async def submit_answer(
+    body: SubmitAnswerRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Submit an answer to a practice problem."""
+    saved = await persist_problem_answer(body, background_tasks, user, db)
     return AnswerResponse(
-        is_correct=is_correct,
-        correct_answer=problem.correct_answer,
-        explanation=problem.explanation,
-        prerequisite_gaps=prerequisite_gaps,
-        warnings=warnings,
+        is_correct=saved["is_correct"],
+        correct_answer=saved["correct_answer"],
+        explanation=saved["explanation"],
+        prerequisite_gaps=saved["prerequisite_gaps"],
+        warnings=saved["warnings"],
     )
 
 

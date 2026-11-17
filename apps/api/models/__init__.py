@@ -4,7 +4,12 @@ from models.user import User
 from models.course import Course
 from models.content import CourseContentTree
 from models.preference import UserPreference, PreferenceSignal
-from models.practice import PracticeProblem, PracticeResult
+from models.practice import (
+    PracticeProblem,
+    PracticeResult,
+    PracticeSession,
+    PracticeSessionItem,
+)
 from models.memory import ConversationMemory
 from models.ingestion import IngestionJob, StudySession, Assignment, WrongAnswer
 from models.progress import LearningProgress, LearningTemplate
@@ -33,6 +38,8 @@ __all__ = [
     "PreferenceSignal",
     "PracticeProblem",
     "PracticeResult",
+    "PracticeSession",
+    "PracticeSessionItem",
     "ConversationMemory",
     "IngestionJob",
     "StudySession",

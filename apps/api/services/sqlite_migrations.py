@@ -18,7 +18,8 @@ from sqlalchemy.schema import CreateTable
 
 from database import Base
 
-REVISION = "sqlite_20261029_01"
+REVISION = "sqlite_20261117_02"
+SUPPORTED_PREVIOUS_REVISIONS = {"sqlite_20261029_01"}
 VERSION_TABLE = "opentutor_schema_version"
 
 
@@ -223,7 +224,7 @@ def upgrade_schema(connection):
     """Upgrade inside a caller-owned write transaction with FK checks disabled."""
     missing, rebuild, indexes = schema_changes(connection)
     revision = current_revision(connection)
-    if revision not in (None, REVISION):
+    if revision not in (None, REVISION) and revision not in SUPPORTED_PREVIOUS_REVISIONS:
         raise RuntimeError(
             f"Unsupported SQLite schema revision {revision}; refusing a downgrade"
         )
