@@ -215,9 +215,9 @@ class Settings(BaseSettings):
                     if sqlite_path.startswith("~"):
                         self.database_url = f"{prefix}{Path(sqlite_path).expanduser()}"
                     break
-        else:
+        elif not self.database_url.startswith(("mysql+asyncmy://", "mysql+aiomysql://")):
             raise ValueError(
-                "SQLite-only local mode requires DATABASE_URL to be empty or start with sqlite"
+                "DATABASE_URL must be empty, a sqlite URL, or mysql+asyncmy:// (Keira rds01)"
             )
         return self
 

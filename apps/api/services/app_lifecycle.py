@@ -25,6 +25,10 @@ async def _maybe_create_tables() -> None:
         if backup:
             logger.info("Upgraded SQLite schema; pre-upgrade backup: %s", backup)
     else:
+        if engine.dialect.name == "mysql":
+            from services.mysql_schema import adapt_metadata_for_mysql
+
+            adapt_metadata_for_mysql(Base.metadata)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     logger.info("Database schema initialization completed")
